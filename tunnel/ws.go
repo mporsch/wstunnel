@@ -8,7 +8,6 @@ import (
 	"html"
 	"io"
 	"net/http"
-	"sync"
 
 	// imported per documentation - https://golang.org/pkg/net/http/pprof/
 	_ "net/http/pprof"
@@ -25,7 +24,7 @@ func httpError(log log15.Logger, w http.ResponseWriter, token, err string, code 
 	http.Error(w, html.EscapeString(err), code)
 }
 
-//websocket error constants
+// websocket error constants
 const (
 	wsReadClose  = iota
 	wsReadError  = iota
@@ -68,6 +67,9 @@ func wsHandler(t *WSTunnelServer, w http.ResponseWriter, r *http.Request) {
 	}
 	// Get/Create RemoteServer
 	rs := t.getRemoteServer(token(tok), true)
+	// force unlock
+	rs.readMutex.TryLock()
+	rs.readMutex.Unlock()
 	rs.remoteAddr = addr
 	rs.lastActivity = time.Now()
 	t.Log.Info("WS new tunnel connection", "token", logTok, "addr", addr, "ws", wsp(ws),
@@ -81,7 +83,7 @@ func wsHandler(t *WSTunnelServer, w http.ResponseWriter, r *http.Request) {
 	// Create synchronization channel
 	ch := make(chan int, 2)
 	// Spawn goroutine to read responses
-	go wsReader(rs, ws, ch, &rs.readWG)
+	go wsReader(rs, ws, ch)
 	// Send requests
 	wsWriter(rs, ws, ch)
 }
@@ -167,15 +169,14 @@ func wsWriter(rs *remoteServer, ws *websocket.Conn, ch chan int) {
 }
 
 // Read responses from the tunnel and fulfill pending requests
-func wsReader(rs *remoteServer, ws *websocket.Conn, ch chan int, readWG *sync.WaitGroup) {
+func wsReader(rs *remoteServer, ws *websocket.Conn, ch chan int) {
 	var err error
 	logToken := cutToken(rs.token)
 	// continue reading until we get an error
 	for {
 		// wait if another response is being sent
-		readWG.Wait()
-		// increment the WaitGroup counter
-		readWG.Add(1)
+		rs.readMutex.Lock()
+
 		ws.SetReadDeadline(time.Time{}) // no timeout, there's the ping-pong for that
 		// read a message from the tunnel
 		var t int
@@ -208,17 +209,16 @@ func wsReader(rs *remoteServer, ws *websocket.Conn, ch chan int, readWG *sync.Wa
 				// great!
 				rs.log.Info("WS   RCV enqueued response", "id", id, "ws", wsp(ws))
 			default:
-				readWG.Done()
+				rs.readMutex.Unlock()
 				rs.log.Info("WS   RCV can't enqueue response", "id", id, "ws", wsp(ws))
 			}
 		} else {
-			readWG.Done()
+			rs.readMutex.Unlock()
 			rs.log.Info("%s #%d: WS   RCV orphan response", "id", id, "ws", wsp(ws))
 		}
 	}
 	// print error message
 	if err != nil {
-		readWG.Done()
 		rs.log.Info("WS   closing", "token", logToken, "err", err.Error(), "ws", wsp(ws))
 	}
 	// close up shop
